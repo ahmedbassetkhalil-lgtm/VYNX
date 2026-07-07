@@ -8,7 +8,9 @@
                   fully clickable role cards with hover effects
   ✔ Real DB     : SQLite (customers / orders / inventory / ledger)
                   → customer requests are INSERTed, ERP SELECTs live data
-  ✔ Real APIs   : geopy (Nominatim) geocoding + NASA POWER irradiance
+  ✔ Real APIs   : Google Geocoding API + Google Solar API + NASA POWER
+                  (API key ONLY via st.secrets["GOOGLE_API_KEY"] — never
+                   hard-coded; admins are prompted if it's missing)
   ✔ Router      : st.session_state navigation, no page reloads
 ------------------------------------------------------------------------------
   requirements.txt:
@@ -16,7 +18,7 @@
       pandas
       plotly
       requests
-      geopy
+      googlemaps
 ==============================================================================
 """
 
@@ -31,13 +33,13 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 
-# geopy is the primary geocoder; requests/Nominatim-HTTP is the fallback
+# Official Google SDK is primary; raw HTTPS via `requests` (still Google
+# endpoints) is the fallback if the package is missing.
 try:
-    from geopy.geocoders import Nominatim
-    from geopy.extra.rate_limiter import RateLimiter
-    GEOPY_OK = True
+    import googlemaps
+    GMAPS_OK = True
 except Exception:
-    GEOPY_OK = False
+    GMAPS_OK = False
 
 # =============================================================================
 # 0) PAGE CONFIG
@@ -171,8 +173,11 @@ T = {
   "calc_sub":"Type your address — we geocode it, scan the roof and design the system.",
   "address":"Your address","address_ph":"e.g. 12 Tahrir St, Dokki, Giza, Egypt",
   "scan_btn":"🛰️ Locate & scan my roof",
-  "scanning1":"Geocoding address (geopy / Nominatim)…",
-  "scanning2":"Analyzing roof from satellite imagery…",
+  "scanning1":"Geocoding address (Google Geocoding API)…",
+  "scanning2":"Scanning roof (Google Solar API)…",
+  "no_key_admin":"⚙️ Google API key is not configured. Administrator: add GOOGLE_API_KEY to Streamlit Secrets (App → Settings → Secrets) then restart the app.",
+  "src_google":"🛰️ Source: Google Solar API (measured)",
+  "src_estimate":"📐 Source: engineering estimate — Google Solar API has no imagery coverage for this location.",
   "scanning3":"Fetching NASA POWER irradiance…",
   "scan_ok":"Roof analysis complete","geo_fail":"Could not locate this address — add city & country.",
   "found_at":"Building located","roof_gross":"Detected roof","roof_obst":"Obstacles",
@@ -243,8 +248,11 @@ T = {
   "calc_sub":"اكتب عنوانك — نحوّله لإحداثيات، نمسح السطح، ونصمم النظام.",
   "address":"عنوانك","address_ph":"مثال: ١٢ شارع التحرير، الدقي، الجيزة، مصر",
   "scan_btn":"🛰️ حدد موقعي وامسح السطح",
-  "scanning1":"جاري تحويل العنوان إلى إحداثيات (geopy)…",
-  "scanning2":"جاري تحليل السطح من صور الأقمار الصناعية…",
+  "scanning1":"جاري تحويل العنوان (Google Geocoding API)…",
+  "scanning2":"جاري مسح السطح (Google Solar API)…",
+  "no_key_admin":"⚙️ مفتاح Google API غير مُهيّأ. مدير النظام: أضف GOOGLE_API_KEY في إعدادات Streamlit Secrets (App ← Settings ← Secrets) ثم أعد تشغيل التطبيق.",
+  "src_google":"🛰️ المصدر: Google Solar API (قياس فعلي)",
+  "src_estimate":"📐 المصدر: تقدير هندسي — تغطية صور Google Solar API غير متاحة لهذا الموقع.",
   "scanning3":"جاري جلب بيانات الإشعاع من ناسا…",
   "scan_ok":"اكتمل تحليل السطح","geo_fail":"تعذر تحديد العنوان — أضف المدينة والدولة.",
   "found_at":"تم تحديد المبنى","roof_gross":"السطح المكتشف","roof_obst":"العوائق",
@@ -451,54 +459,120 @@ FB_TEMPS = [14,16,19,24,28,30,31,31,29,26,20,16]
 FB_GHI   = [5.0,5.6,6.4,7.1,7.5,7.9,7.7,7.4,6.9,6.0,5.2,4.8]
 
 # =============================================================================
-# 6) REAL GEOCODING (geopy → Nominatim) + roof scan + NASA POWER
+# 6) GOOGLE APIs — REAL Geocoding + REAL Solar API  (key via st.secrets ONLY)
 # =============================================================================
+def get_google_key():
+    """
+    SECURITY: the API key is read exclusively from Streamlit secrets.
+    Never hard-code keys in source. On Streamlit Cloud set it under:
+      App → Settings → Secrets:
+          GOOGLE_API_KEY = "AIza...your-key..."
+    Locally: .streamlit/secrets.toml with the same line (git-ignored).
+    """
+    try:
+        key = st.secrets["GOOGLE_API_KEY"]
+        return key if key and str(key).strip() else None
+    except Exception:
+        return None
+
+
 @st.cache_resource
-def _geocoder():
-    """One rate-limited geopy geocoder per server process (Nominatim ToS)."""
-    g = Nominatim(user_agent="SolarBridge/3.0", timeout=10)
-    return RateLimiter(g.geocode, min_delay_seconds=1.1)
+def _gmaps_client():
+    """One googlemaps.Client per server process (official Google SDK)."""
+    if GMAPS_OK and get_google_key():
+        return googlemaps.Client(key=get_google_key())
+    return None
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode_address(address: str):
     """
-    REAL geocoding: address string → (lat, lon, display_name).
-    Primary : geopy → OpenStreetMap Nominatim (free, no key)
-    Fallback: raw Nominatim HTTP via requests (if geopy missing/fails)
+    REAL Google Geocoding API: address string → (lat, lon, formatted_address).
+    Primary : official `googlemaps` SDK.
+    Fallback: direct HTTPS call via `requests` to the same Google endpoint
+              (still Google — used only if the SDK isn't installed).
+    Returns None if the address can't be resolved.
     """
-    if GEOPY_OK:
+    key = get_google_key()
+    if key is None:
+        return None                       # guarded earlier in the UI too
+    client = _gmaps_client()
+    if client is not None:                # ---- googlemaps SDK path ----
         try:
-            loc = _geocoder()(address)
-            if loc:
-                return loc.latitude, loc.longitude, loc.address
+            res = client.geocode(address)
+            if res:
+                loc = res[0]["geometry"]["location"]
+                return loc["lat"], loc["lng"], res[0]["formatted_address"]
         except Exception:
             pass
-    try:  # HTTP fallback
-        r = requests.get("https://nominatim.openstreetmap.org/search",
-                         params={"q": address, "format": "json", "limit": 1},
-                         headers={"User-Agent": "SolarBridge/3.0"}, timeout=10)
+    try:                                  # ---- raw HTTPS path (Google) ----
+        r = requests.get(
+            "https://maps.googleapis.com/maps/api/geocode/json",
+            params={"address": address, "key": key}, timeout=10)
         js = r.json()
-        if js:
-            return float(js[0]["lat"]), float(js[0]["lon"]), js[0]["display_name"]
+        if js.get("status") == "OK":
+            top = js["results"][0]
+            loc = top["geometry"]["location"]
+            return loc["lat"], loc["lng"], top["formatted_address"]
     except Exception:
         pass
     return None
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def solar_api_roof_scan(lat: float, lon: float):
     """
-    Google Solar API *simulation* — deterministic per location.
-    Production swap: GET solar.googleapis.com/v1/buildingInsights:findClosest
-      → solarPotential.wholeRoofStats.areaMeters2 (gross)
-      → per-segment stats → net usable after obstacles/shading.
-    Simulation ranges mimic real urban residential scans:
-      gross 80–320 m² · obstacles 10–28% · confidence 88–99%.
+    REAL Google Solar API — buildingInsights:findClosest.
+      gross roof  : solarPotential.wholeRoofStats.areaMeters2
+      net usable  : solarPotential.maxArrayAreaMeters2
+                    (Google already excludes obstacles, edges & shaded zones,
+                     so obstacles = gross − net)
+      confidence  : imageryQuality (HIGH/MEDIUM/LOW → 97/92/88 %)
+
+    COVERAGE NOTE (important for production):
+      Google Solar API covers a specific list of countries (strong in
+      US/EU/JP/AU; most of MENA is NOT yet covered). When the API returns
+      404 "not found" for a location, we fall back to a clearly-labelled
+      deterministic ESTIMATE (source='estimate') instead of failing, and
+      the UI displays which source was used. Remove the fallback only if
+      you operate exclusively inside covered regions.
     """
+    key = get_google_key()
+    if key:
+        try:
+            r = requests.get(
+                "https://solar.googleapis.com/v1/buildingInsights:findClosest",
+                params={"location.latitude": f"{lat:.6f}",
+                        "location.longitude": f"{lon:.6f}",
+                        "requiredQuality": "LOW",
+                        "key": key},
+                timeout=15)
+            if r.status_code == 200:
+                js = r.json()
+                sp = js.get("solarPotential", {})
+                gross = float(sp.get("wholeRoofStats", {})
+                                .get("areaMeters2", 0.0))
+                net = float(sp.get("maxArrayAreaMeters2", 0.0))
+                if gross > 0 and net > 0:
+                    conf = {"HIGH": 97, "MEDIUM": 92,
+                            "LOW": 88}.get(js.get("imageryQuality"), 90)
+                    return {"gross_m2": round(gross, 1),
+                            "obstacles_m2": round(max(gross - net, 0.0), 1),
+                            "net_m2": round(net, 1),
+                            "confidence": conf,
+                            "source": "google"}
+            # 404 → building/region not in Solar API coverage → estimate
+        except Exception:
+            pass
+
+    # ---- documented fallback: deterministic estimate (no coverage) ----------
     seed = int(hashlib.sha256(f"{lat:.5f},{lon:.5f}".encode()).hexdigest(), 16)
-    gross = 80 + (seed % 241)
-    obst  = round(gross * (0.10 + ((seed >> 8) % 19) / 100.0), 1)
-    conf  = 88 + ((seed >> 16) % 12)
+    gross = 80 + (seed % 241)                        # 80–320 m² residential
+    obst = round(gross * (0.10 + ((seed >> 8) % 19) / 100.0), 1)  # 10–28 %
     return {"gross_m2": float(gross), "obstacles_m2": obst,
-            "net_m2": round(gross - obst, 1), "confidence": conf}
+            "net_m2": round(gross - obst, 1),
+            "confidence": 88 + ((seed >> 16) % 12),
+            "source": "estimate"}
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_nasa_power(lat: float, lon: float):
@@ -629,6 +703,13 @@ def page_calculator():
     st.markdown(f"## ⚡ {tr('calc_title')}")
     st.caption(f"{tr('welcome')} **{cust['name']}** 👋 — {tr('calc_sub')}")
 
+    # ---- production guard: Google key MUST be configured by the admin ------
+    if get_google_key() is None:
+        st.error(tr("no_key_admin"))
+        st.code('# .streamlit/secrets.toml\nGOOGLE_API_KEY = "AIza...your-key..."',
+                language="toml")
+        return
+
     # (A) the ONLY location input — a single address search box
     address = st.text_input(f"📍 {tr('address')}", placeholder=tr("address_ph"))
     if st.button(tr("scan_btn"), type="primary", use_container_width=True):
@@ -636,7 +717,7 @@ def page_calculator():
             st.error(tr("geo_fail"))
         else:
             with st.status(tr("scanning1"), expanded=False) as s:
-                geo = geocode_address(address.strip())     # REAL geopy call
+                geo = geocode_address(address.strip())  # REAL Google Geocoding
                 if geo is None:
                     s.update(label=tr("geo_fail"), state="error")
                 else:
@@ -668,6 +749,11 @@ def page_calculator():
         ✅ <b>{tr('roof_net')}:</b> <b>{roof['net_m2']:,.1f} m²</b> ·
         🎯 <b>{tr('confidence')}:</b> {roof['confidence']}%
       </div>""", unsafe_allow_html=True)
+    # transparency badge: measured by Google Solar API vs estimated (no coverage)
+    if roof.get("source") == "google":
+        st.caption(tr("src_google"))
+    else:
+        st.caption(tr("src_estimate"))
     st.map(pd.DataFrame({"lat": [roof["lat"]], "lon": [roof["lon"]]}),
            size=30, zoom=16)
 
