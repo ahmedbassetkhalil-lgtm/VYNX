@@ -759,10 +759,10 @@ def page_calculator():
                     if geo_err == "ZERO_RESULTS":
                         # genuinely unresolvable address → friendly message
                         s.update(label=tr("geo_fail"), state="error")
-                    else:
-                        # TECHNICAL failure → print the exact error verbatim
-                        s.update(label="⚠️ Geocoding API error", state="error")
-                        st.error(f"🔧 {geo_err}")
+                   else:
+            # تم التعديل هنا ليظهر الخطأ فوراً في كل الأحوال
+            st.error(f"DEBUG ERROR: {geo_err}")
+            s.update(label="Technical Error", state="error") 
                 else:
                     lat, lon, display = geo
                     s.update(label=tr("scanning2"))
