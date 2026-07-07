@@ -474,7 +474,7 @@ def get_google_key():
         key = st.secrets["GOOGLE_API_KEY"]
         return key if key and str(key).strip() else None
     except Exception:
-        return None
+        return str(e)
 
 
 @st.cache_resource
